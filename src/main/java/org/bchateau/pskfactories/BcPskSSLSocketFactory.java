@@ -34,7 +34,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.Vector;
+import java.util.Arrays;
 
+import javax.net.ssl.HandshakeCompletedEvent;
 import javax.net.ssl.SSLPeerUnverifiedException;
 import javax.net.ssl.SSLSession;
 import javax.net.ssl.SSLSessionBindingEvent;
@@ -67,7 +69,15 @@ import org.bouncycastle.tls.crypto.impl.bc.BcTlsCrypto;
  */
 public class BcPskSSLSocketFactory extends SSLSocketFactory {
 
-    private static final boolean DEBUG = false;
+    /**
+     * Log all warnings.
+     */
+    public static boolean logWarnings = false;
+
+    /**
+     * Old versions of this class did not throw on fatal alerts, set this to false to restore that behavior.
+     */
+    public static boolean throwIOExceptionOnFatalAlert = true;
 
     private final BcPskTlsParams params;
     private final TlsCrypto crypto;
@@ -79,7 +89,7 @@ public class BcPskSSLSocketFactory extends SSLSocketFactory {
         this.pskIdentity = pskIdentity;
     }
 
-    private static class BcPskTlsClientProtocol extends TlsClientProtocol {
+    static class BcPskTlsClientProtocol extends TlsClientProtocol {
         public BcPskTlsClientProtocol(InputStream input, OutputStream output) {
             super(input, output);
         }
@@ -96,12 +106,20 @@ public class BcPskSSLSocketFactory extends SSLSocketFactory {
 
         @Override
         protected void raiseAlertFatal(short alertDescription, String message, Throwable cause) throws IOException {
-            cause.printStackTrace();
+            if (throwIOExceptionOnFatalAlert) {
+                throw new IOException(message, cause);
+            }
+
+            // Legacy behavior
+            System.err.println("Fatal alert: " + message);
+            if (cause != null) {
+                cause.printStackTrace();
+            }
         }
 
         @Override
         protected void raiseAlertWarning(short alertDescription, String message) throws IOException {
-            if (DEBUG) {
+            if (logWarnings) {
                 System.out.println(message);
             }
         }
@@ -163,35 +181,43 @@ public class BcPskSSLSocketFactory extends SSLSocketFactory {
     }
 
     /**
-     * Not supported.
+     * Creates a socket and connects it to the specified host and port.
      */
     @Override
-    public Socket createSocket(String host, int port) throws IOException, UnknownHostException {
-        throw new UnsupportedOperationException();
+    public Socket createSocket(String host, int port) throws IOException {
+        Socket socket = new Socket(host, port);
+        return createSocket(socket, host, port, true);
     }
 
     /**
-     * Not supported.
+     * Creates a socket and connects it to the specified InetAddress and port.
      */
     @Override
     public Socket createSocket(InetAddress host, int port) throws IOException {
-        throw new UnsupportedOperationException();
+        Socket socket = new Socket(host, port);
+        return createSocket(socket, host.getHostAddress(), port, true);
     }
 
     /**
-     * Not supported.
+     * Creates a socket and connects it to the specified host and port, using the specified local address and port.
      */
     @Override
-    public Socket createSocket(String host, int port, InetAddress localHost, int localPort) throws IOException, UnknownHostException {
-        throw new UnsupportedOperationException();
+    public Socket createSocket(String host, int port, InetAddress localHost, int localPort) throws IOException {
+        Socket socket = new Socket();
+        socket.bind(new java.net.InetSocketAddress(localHost, localPort));
+        socket.connect(new java.net.InetSocketAddress(host, port));
+        return createSocket(socket, host, port, true);
     }
 
     /**
-     * Not supported.
+     * Creates a socket and connects it to the specified address and port, using the specified local address and port.
      */
     @Override
     public Socket createSocket(InetAddress address, int port, InetAddress localAddress, int localPort) throws IOException {
-        throw new UnsupportedOperationException();
+        Socket socket = new Socket();
+        socket.bind(new java.net.InetSocketAddress(localAddress, localPort));
+        socket.connect(new java.net.InetSocketAddress(address, port));
+        return createSocket(socket, address.getHostAddress(), port, true);
     }
 
     /**
@@ -234,7 +260,6 @@ public class BcPskSSLSocketFactory extends SSLSocketFactory {
                 }
             }
 
-            @Override
             public String getApplicationProtocol() {
                 return tlsClientProtocol.getApplicationProtocol();
             }
@@ -341,6 +366,20 @@ public class BcPskSSLSocketFactory extends SSLSocketFactory {
                     }
 
                     @Override
+                    public java.util.Hashtable getClientExtensions() throws IOException {
+                        java.util.Hashtable extensions = super.getClientExtensions();
+                        String[] alpn = params.getApplicationProtocols();
+                        if (alpn.length > 0) {
+                            java.util.Vector<org.bouncycastle.tls.ProtocolName> alpnList = new java.util.Vector<>();
+                            for (String p : alpn) {
+                                alpnList.add(org.bouncycastle.tls.ProtocolName.asUtf8Encoding(p));
+                            }
+                            org.bouncycastle.tls.TlsExtensionsUtils.addALPNExtensionClient(extensions, alpnList);
+                        }
+                        return extensions;
+                    }
+
+                    @Override
                     public Vector getExternalPSKs() {
                         Vector<TlsPSKExternal> externals = new Vector<>();
                         TlsSecret secret = crypto.createSecret(pskIdentity.getPSK());
@@ -348,6 +387,8 @@ public class BcPskSSLSocketFactory extends SSLSocketFactory {
                         return externals;
                     }
                 });
+
+                notifyHandshakeCompleted(new HandshakeCompletedEvent(this, getSession()));
             }
 
             @Override
@@ -452,6 +493,10 @@ public class BcPskSSLSocketFactory extends SSLSocketFactory {
                         return tlsClientProtocol.getProtocol();
                     }
 
+                    public String getApplicationProtocol() {
+                        return tlsClientProtocol.getApplicationProtocol();
+                    }
+
                     @Override
                     public SSLSessionContext getSessionContext() {
                         throw new UnsupportedOperationException();
@@ -474,8 +519,9 @@ public class BcPskSSLSocketFactory extends SSLSocketFactory {
 
                     @Override
                     public boolean isValid() {
-                        // TODO: Check session time limit
-                        return isValid && !socket.isClosed() && !tlsClientProtocol.isClosed();
+                        boolean timedOut = params.getSessionTimeout() > 0 && 
+                                          (System.currentTimeMillis() - creationTime >= params.getSessionTimeout());
+                        return isValid && !timedOut && !socket.isClosed() && !tlsClientProtocol.isClosed();
                     }
 
                     @Override

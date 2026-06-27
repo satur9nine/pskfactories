@@ -16,6 +16,7 @@
 
 package org.bchateau.pskfactories;
 
+import javax.net.ssl.HandshakeCompletedEvent;
 import javax.net.ssl.HandshakeCompletedListener;
 import javax.net.ssl.SSLSocket;
 import java.io.IOException;
@@ -35,7 +36,7 @@ import java.util.List;
  */
 abstract class WrappedSSLSocket extends SSLSocket {
 
-    private final Socket socket;
+    protected final Socket socket;
 
     private final List<HandshakeCompletedListener> listeners = new ArrayList<>(2);
 
@@ -251,6 +252,14 @@ abstract class WrappedSSLSocket extends SSLSocket {
         }
         if (!listeners.remove(listener)) {
             throw new IllegalArgumentException("'listener' is not registered");
+        }
+    }
+
+    protected void notifyHandshakeCompleted(HandshakeCompletedEvent event) {
+        synchronized (listeners) {
+            for (HandshakeCompletedListener listener : listeners) {
+                listener.handshakeCompleted(event);
+            }
         }
     }
 

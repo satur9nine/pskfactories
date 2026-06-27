@@ -28,7 +28,13 @@ To use this implementation copy the org.bchateau.pskfactories source code from t
 
 ## Use
 
-See the TestBcPskFactories#testServerClientConnect() method for example client and server use.
+- See the `TestServerClientIntegration#runPskClient()` method for example client use
+- See the `TestServerClientIntegration#startPskServer()` method for example server use
+
+## Build & Test
+
+    ./gradlew jar
+    ./gradlew test
 
 # License
 

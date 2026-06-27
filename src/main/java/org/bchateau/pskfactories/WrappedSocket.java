@@ -23,216 +23,141 @@ import java.net.InetAddress;
 import java.net.Socket;
 import java.net.SocketAddress;
 import java.net.SocketException;
+import java.util.concurrent.atomic.AtomicBoolean;
 
+import org.bouncycastle.tls.crypto.TlsCrypto;
+import org.bouncycastle.tls.TlsCloseable;
+import org.bouncycastle.tls.TlsServer;
 
 /**
  * Wraps one Socket with another Socket but redirects IO to provided parameter
  * streams to allow for TLS implementation to process the data moving through
  * the Socket.
+ * 
+ * Handshaking is performed lazily on the first call to getInputStream, 
+ * getOutputStream, or startHandshake.
  */
-class WrappedSocket extends Socket {
+class WrappedSocket extends WrappedSSLSocket {
 
-    private final Socket socket;
-    private final InputStream in;
-    private final OutputStream out;
+    private final TlsServer tlsServer;
+    private final TlsCrypto crypto;
+    private TlsCloseable protocol;
+    private InputStream in;
+    private OutputStream out;
 
-    public WrappedSocket(Socket socket, InputStream in, OutputStream out) throws IOException {
-        super((java.net.SocketImpl) null);
-        this.socket = socket;
-        if (in == null || out == null) {
-            throw new NullPointerException();
+    public WrappedSocket(Socket socket, TlsServer tlsServer, TlsCrypto crypto) throws IOException {
+        super(socket);
+        this.tlsServer = tlsServer;
+        this.crypto = crypto;
+    }
+
+    private synchronized void ensureHandshake() throws IOException {
+        if (protocol != null) {
+            return;
         }
-        this.in = in;
-        this.out = out;
-    }
 
-    @Override
-    public InetAddress getInetAddress() {
-        return socket.getInetAddress();
-    }
-
-    @Override
-    public InetAddress getLocalAddress() {
-        return socket.getLocalAddress();
-    }
-
-    @Override
-    public int getPort() {
-        return socket.getPort();
-    }
-
-    @Override
-    public int getLocalPort() {
-        return socket.getLocalPort();
+        BcPskSSLServerSocketFactory.BcPskTlsServerProtocol tlsProtocol = 
+                new BcPskSSLServerSocketFactory.BcPskTlsServerProtocol(socket.getInputStream(), socket.getOutputStream());
+        tlsProtocol.accept(tlsServer);
+        this.protocol = tlsProtocol;
+        this.in = tlsProtocol.getInputStream();
+        this.out = tlsProtocol.getOutputStream();
     }
 
     @Override
     public InputStream getInputStream() throws IOException {
+        ensureHandshake();
         return in;
     }
 
     @Override
     public OutputStream getOutputStream() throws IOException {
+        ensureHandshake();
         return out;
     }
 
     @Override
-    public void setTcpNoDelay(boolean on) throws SocketException {
-        socket.setTcpNoDelay(on);
-    }
-
-    @Override
-    public boolean getTcpNoDelay() throws SocketException {
-        return socket.getTcpNoDelay();
-    }
-
-    @Override
-    public void setSoLinger(boolean on, int val) throws SocketException {
-        socket.setSoLinger(on, val);
-    }
-
-    @Override
-    public int getSoLinger() throws SocketException {
-        return socket.getSoLinger();
-    }
-
-    @Override
-    public void setSoTimeout(int timeout) throws SocketException {
-        socket.setSoTimeout(timeout);
-    }
-
-    @Override
-    public int getSoTimeout() throws SocketException {
-        return socket.getSoTimeout();
+    public void startHandshake() throws IOException {
+        ensureHandshake();
     }
 
     @Override
     public void close() throws IOException {
-        socket.close();
-    }
-
-    @Override
-    public boolean isClosed() {
-        return socket.isClosed();
-    }
-
-    @Override
-    public boolean isConnected() {
-        return socket.isConnected();
-    }
-
-    @Override
-    public boolean isBound() {
-        return socket.isBound();
-    }
-
-    @Override
-    public void shutdownInput() throws IOException {
-        socket.shutdownInput();
-    }
-
-    @Override
-    public void shutdownOutput() throws IOException {
-        socket.shutdownOutput();
-    }
-
-    @Override
-    public boolean isInputShutdown() {
-        return socket.isInputShutdown();
-    }
-
-    @Override
-    public boolean isOutputShutdown() {
-        return socket.isOutputShutdown();
-    }
-
-    @Override
-    public SocketAddress getRemoteSocketAddress() {
-        return socket.getRemoteSocketAddress();
-    }
-
-    @Override
-    public SocketAddress getLocalSocketAddress() {
-        return socket.getLocalSocketAddress();
-    }
-
-    @Override
-    public void setOOBInline(boolean on) throws SocketException {
-        throw new UnsupportedOperationException();
-    }
-
-    @Override
-    public boolean getOOBInline() throws SocketException {
-        return false;
-    }
-
-    @Override
-    public synchronized void setSendBufferSize(int size) throws SocketException {
-        socket.setSendBufferSize(size);
-    }
-
-    @Override
-    public synchronized int getSendBufferSize() throws SocketException {
-        return socket.getSendBufferSize();
-    }
-
-    @Override
-    public synchronized void setReceiveBufferSize(int size) throws SocketException {
-        socket.setReceiveBufferSize(size);
-    }
-
-    @Override
-    public synchronized int getReceiveBufferSize() throws SocketException {
-        return socket.getReceiveBufferSize();
-    }
-
-    @Override
-    public void setKeepAlive(boolean on) throws SocketException {
-        socket.setKeepAlive(on);
-    }
-
-    @Override
-    public boolean getKeepAlive() throws SocketException {
-        return socket.getKeepAlive();
-    }
-
-    @Override
-    public void setTrafficClass(int tc) throws SocketException {
-        socket.setTrafficClass(tc);
-    }
-
-    @Override
-    public int getTrafficClass() throws SocketException {
-        return socket.getTrafficClass();
-    }
-
-    @Override
-    public void setReuseAddress(boolean on) throws SocketException {
-        socket.setReuseAddress(on);
-    }
-
-    @Override
-    public boolean getReuseAddress() throws SocketException {
-        return socket.getReuseAddress();
-    }
-
-    @Override
-    public void setPerformancePreferences(int connectionTime, int latency, int bandwidth) {
-        socket.setPerformancePreferences(connectionTime, latency, bandwidth);
-    }
-
-    @Override
-    public void bind(SocketAddress bindpoint) throws IOException {
-        throw new UnsupportedOperationException();
-    }
-
-    @Override
-    public void sendUrgentData(int data) throws IOException {
-        throw new UnsupportedOperationException();
+        try {
+            if (protocol != null) {
+                protocol.close();
+            }
+        } catch (Exception e) {
+            // Ignore
+        }
+        super.close();
     }
 
     @Override
     public String toString() {
         return "Wrapped" + socket.toString();
+    }
+
+    @Override
+    public boolean getEnableSessionCreation() {
+        return true;
+    }
+
+    @Override
+    public void setEnableSessionCreation(boolean flag) {}
+
+    @Override
+    public String[] getEnabledCipherSuites() {
+        return new String[0];
+    }
+
+    @Override
+    public void setEnabledCipherSuites(String[] cipherSuites) {}
+
+    @Override
+    public String[] getEnabledProtocols() {
+        return new String[0];
+    }
+
+    @Override
+    public void setEnabledProtocols(String[] protocols) {}
+
+    @Override
+    public boolean getNeedClientAuth() {
+        return false;
+    }
+
+    @Override
+    public void setNeedClientAuth(boolean need) {}
+
+    @Override
+    public boolean getWantClientAuth() {
+        return false;
+    }
+
+    @Override
+    public void setWantClientAuth(boolean want) {}
+
+    @Override
+    public String[] getSupportedCipherSuites() {
+        return new String[0];
+    }
+
+    @Override
+    public String[] getSupportedProtocols() {
+        return new String[0];
+    }
+
+    @Override
+    public javax.net.ssl.SSLSession getSession() {
+        return null;
+    }
+
+    @Override
+    public void setUseClientMode(boolean mode) {}
+
+    @Override
+    public boolean getUseClientMode() {
+        return false;
     }
 }

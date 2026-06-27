@@ -58,6 +58,9 @@ public class BcPskTlsParams {
     private final int[] supportedCipherSuiteCodes;
     private final String[] supportedCipherSuites;
     private final String[] supportedProtocols;
+    private final int sessionTimeout;
+    private final String[] applicationProtocols;
+    private static final int DEFAULT_SESSION_TIMEOUT = 0; // No timeout by default
 
     /**
      * Create an instance that supports TLSv1.2 and TLSv1.3 with the following cipher suites:
@@ -70,10 +73,22 @@ public class BcPskTlsParams {
      * </pre>
      */
     public BcPskTlsParams() {
-        this.supportedProtocolVersions = defaultSupportedProtocolVersions.clone();
-        this.supportedCipherSuiteCodes = defaultSupportedCipherSuiteCodes.clone();
-        this.supportedCipherSuites = cipherSuiteCodesToStrings(supportedCipherSuiteCodes);
-        this.supportedProtocols = protocolVersionsToStrings(supportedProtocolVersions);
+        this(defaultSupportedProtocolVersions, defaultSupportedCipherSuiteCodes, DEFAULT_SESSION_TIMEOUT, new String[0]);
+    }
+
+    /**
+     * Create an instance that supports TLSv1.2 and TLSv1.3 with the following cipher suites:
+     * <pre>
+     * TLS_AES_128_GCM_SHA256,
+     * TLS_AES_256_GCM_SHA384,
+     * TLS_ECDHE_PSK_WITH_AES_128_GCM_SHA256,
+     * TLS_ECDHE_PSK_WITH_CHACHA20_POLY1305_SHA256,
+     * TLS_ECDHE_PSK_WITH_AES_256_GCM_SHA384,
+     * </pre>
+     * @param sessionTimeout The session timeout in milliseconds. 0 or negative means no timeout.
+     */
+    public BcPskTlsParams(int sessionTimeout) {
+        this(defaultSupportedProtocolVersions, defaultSupportedCipherSuiteCodes, sessionTimeout, new String[0]);
     }
 
     /**
@@ -82,6 +97,31 @@ public class BcPskTlsParams {
      * (i.e.: if TLSv1.2 only is given then only TLSv1.2 cipher suites must be given).
      */
     public BcPskTlsParams(ProtocolVersion[] supportedProtocolVersions, int[] supportedCipherSuiteCodes) {
+        this(supportedProtocolVersions, supportedCipherSuiteCodes, DEFAULT_SESSION_TIMEOUT, new String[0]);
+    }
+
+    /**
+     * Create an instance that supports the given protocol versions and cipher suites. It is up to
+     * the caller to ensure the given cipher suites are compatible with the given protocol versions
+     * (i.e.: if TLSv1.2 only is given then only TLSv1.2 cipher suites must be given).
+     *
+     * @param supportedProtocolVersions Supported TLS protocol versions.
+     * @param supportedCipherSuiteCodes Supported cipher suite codes.
+     * @param sessionTimeout The session timeout in milliseconds. 0 or negative means no timeout.
+     */
+    public BcPskTlsParams(ProtocolVersion[] supportedProtocolVersions, int[] supportedCipherSuiteCodes, int sessionTimeout) {
+        this(supportedProtocolVersions, supportedCipherSuiteCodes, sessionTimeout, new String[0]);
+    }
+
+    /**
+     * Create an instance that supports the given protocol versions, cipher suites, and application protocols.
+     *
+     * @param supportedProtocolVersions Supported TLS protocol versions.
+     * @param supportedCipherSuiteCodes Supported cipher suite codes.
+     * @param sessionTimeout The session timeout in milliseconds. 0 or negative means no timeout.
+     * @param applicationProtocols Supported application protocols (ALPN).
+     */
+    public BcPskTlsParams(ProtocolVersion[] supportedProtocolVersions, int[] supportedCipherSuiteCodes, int sessionTimeout, String[] applicationProtocols) {
         this.supportedProtocolVersions = supportedProtocolVersions.clone();
         // As-is Bouncy Castle breaks if TLSv1.2 is listed earlier than TLSv1.3, this ensures the
         // protocols are ordered by highest version first
@@ -89,6 +129,8 @@ public class BcPskTlsParams {
         this.supportedCipherSuiteCodes = supportedCipherSuiteCodes.clone();
         this.supportedCipherSuites = cipherSuiteCodesToStrings(supportedCipherSuiteCodes);
         this.supportedProtocols = protocolVersionsToStrings(supportedProtocolVersions);
+        this.sessionTimeout = sessionTimeout;
+        this.applicationProtocols = applicationProtocols != null ? applicationProtocols.clone() : new String[0];
     }
 
     public static String toJavaName(ProtocolVersion version) {
@@ -192,6 +234,14 @@ public class BcPskTlsParams {
 
     public int[] getSupportedCipherSuiteCodes() {
         return supportedCipherSuiteCodes.clone();
+    }
+
+    public int getSessionTimeout() {
+        return sessionTimeout;
+    }
+
+    public String[] getApplicationProtocols() {
+        return applicationProtocols.clone();
     }
 
     public ProtocolVersion[] getSupportedProtocolVersions() {
