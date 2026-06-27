@@ -1,0 +1,38 @@
+Cleanup
+
+- Note in top of each file that references JDK line numbers are for openjdk branch jdk-21-ga
+- README.md should only document what is special about these classes, not re-explain JSSE and what can be read in official JDK javadocs, include only what is absolutely necessary for use and a minimal example. A new internal MD doc can be created if needed, mostly perhaps it should note how this was accomplished and various coding gotchas, one primary technique is having access to the JDK source and BouncyCastle source while coding to use as reference.
+- Test SSLEngine with a noteworthy third party library
+
+Test Notes
+
+- TestServerClientIntegration.java:221 — a moved test changed meaning. testServerTls13ClientTlsDefaultConnect now passes tls13Params to the client; pre-commit it passed defaultParams. The TLS-1.3-server ×
+  TLS-default-client case is gone, and the test is now a duplicate of the 1.3×1.3 pairing. Restore defaultParams.
+- testServerSocketIntrospectionIsPopulated asserts bookkeeping, not negotiation. setEnabledCipherSuites(new String[]{suite}) runs after the latch proves the handshake finished, and only the getter length is
+  checked.
+- testSessionIsStableAndTimesOut can pass vacuously. No assertTrue(isValid()) before the sleep, so an always-false isValid() passes; firstSession and secondSession are the same object, so the second assertFalse
+  adds nothing; the server-side isValid() copy (WrappedSocket.java:208-212) is never exercised; timeout ≤ 0 ("no timeout") is never exercised; invalidate() has zero call sites in the suite.
+- testInvalidPskFails exercises the wrong path. createTestTlsPSKIdentityManager throws for an unknown identity, so BC's unknown_psk_identity alert (TlsPSKKeyExchange.java:242-245) and the factory's own return
+  null branch are never reached — the other manager in the same file (testIdentityMgr) returns null and is unused here. catch (Exception e) treats any failure (bind error, harness bug) as "server rejected", and
+  the outer catch (IOException) skips the client assertThrows entirely, so the client half can assert nothing.
+- ALPN coverage is one-sided and one-case. Only the client's getApplicationProtocol() is read; the server's WrappedSocket.session.getApplicationProtocol() and getProtocolNames() (including its protocols.length ==
+  0 → null branch) are never read. No mismatch case, no TLS 1.3 ALPN, and both threads swallow exceptions, so a failure surfaces only as "h2" vs null.
+- testApplicationProtocolsAreValidated covers 3 of 5 rules. Untested: 255-octet boundary, printable-ASCII range, null element, and that getApplicationProtocols() hands back a copy.
+- testNamedBuildersMatchPositionalForm compares lengths only — a builder returning the wrong set of the right size passes; the builders' job is carrying the other fields over.
+- Zero coverage on new surface (grep, 0 hits across src/test): logWarnings, getOutputStream, get/setEnableSessionCreation, getDefaultCipherSuites,
+  removeHandshakeCompletedListener, addHandshakeCompletedListener(null), invalidate(). The listener-snapshot semantics (WrappedSSLSocket.java:262-272) and the server-side idempotence guard
+  (WrappedSocket.java:243-249) are untested — testStartHandshakeIsIdempotent covers the client's handshakeCompleted flag, a different mechanism.
+- Duplication: the anonymous TlsPSKIdentity block is copy-pasted 5×, the accept()-thread harness 6×. createTestTlsPSKIdentityManager() already exists as the pattern to follow.
+- Dead imports in TestBcPskFactories.java: java.util.Arrays imported twice (:18, :23), StandardCharsets (:22), CompletableFuture (:24), CompletionException (:25) — no uses.
+- Order-dependent fixtures: KEY_1/KEY_2/testPskKey are static final and shared across tests; if copyOnRead regressed, BC's Arrays.fill zeroes a class-level array and cascades unrelated failures.
+  testPskBufferSurvivesHandshake already uses a local array — do the same elsewhere.
+- startPskServer's port parameter is now always 0 (9 call sites), making boundPort's ternary at :160 dead.
+
+Build & docs Notes
+
+- Commit message under-describes the change: the bullets cover ALPN, session timeout, and the WrappedSocket refactor; the diff also splits the test suite into
+  TestBcPskFactories/TestServerClientIntegration/TesterSupport, bumps the Gradle wrapper 7.6.4 → 8.14.5, junit 5.10.2 → 5.14.4 (plus platform("org.junit:junit-bom:…") and testRuntimeOnly launcher), adds a 120 s
+  test timeout, and rewrites .gitignore.
+- README's new "Behaviour worth knowing" section is otherwise accurate: ./gradlew jar and ./gradlew test both work; the ALPN/timeout/PSK-copy bullets match the code. The lazy-handshake bullet is wrong on the
+  client (above).
+- test timeout raised to 120 s against a ~14 s local run — fine, but the suite is timing-based (Thread.sleep(400), 5 s awaits), so it's flaky-prone rather than deterministic.

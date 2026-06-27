@@ -22,14 +22,17 @@ import java.io.OutputStream;
 import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.net.SocketAddress;
+import java.net.SocketException;
+import java.net.SocketOption;
+import java.net.InetSocketAddress;
+import java.nio.channels.ServerSocketChannel;
 import java.security.SecureRandom;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.HashSet;
-import java.util.List;
+import java.util.Arrays;
 import java.util.Set;
 import java.util.Vector;
 
+import javax.net.ssl.SSLParameters;
 import javax.net.ssl.SSLServerSocket;
 import javax.net.ssl.SSLServerSocketFactory;
 
@@ -41,6 +44,11 @@ import org.bouncycastle.tls.TlsPSKExternal;
 import org.bouncycastle.tls.TlsPSKIdentityManager;
 import org.bouncycastle.tls.TlsServer;
 import org.bouncycastle.tls.TlsServerProtocol;
+import org.bouncycastle.tls.ProtocolName;
+import org.bouncycastle.tls.AlertDescription;
+import org.bouncycastle.tls.AlertLevel;
+import org.bouncycastle.tls.ContentType;
+import org.bouncycastle.tls.TlsPeer;
 import org.bouncycastle.tls.crypto.TlsCrypto;
 import org.bouncycastle.tls.crypto.TlsSecret;
 import org.bouncycastle.tls.crypto.impl.bc.BcTlsCrypto;
@@ -51,7 +59,22 @@ import org.bouncycastle.tls.crypto.impl.bc.BcTlsCrypto;
  */
 public class BcPskSSLServerSocketFactory extends SSLServerSocketFactory {
 
-    private static final boolean DEBUG = false;
+    /**
+     * Echo warning-level alerts to stdout as they are raised. The alert is sent on the wire
+     * either way; this flag only decides whether the caller sees it.
+     */
+    public boolean logWarnings = false;
+
+    /**
+     * Old versions of this class did not throw on fatal alerts, set this to false to restore that behavior.
+     * That mode reports a failed handshake as a successful one, so it is legacy-only; leave it true unless
+     * matching an old caller.
+     */
+    public boolean throwIOExceptionOnFatalAlert = true;
+
+    // Backlog of connections queued on the delegate ServerSocket; same default as
+    // sun.security.ssl.SSLServerSocketFactoryImpl's.
+    private static final int DEFAULT_BACKLOG = 50;
 
     private final BcPskTlsParams params;
     private final TlsCrypto crypto;
@@ -63,36 +86,99 @@ public class BcPskSSLServerSocketFactory extends SSLServerSocketFactory {
         this.pskIdentityMgr = pskIdentityMgr;
     }
 
-    private static class BcPskTlsServerProtocol extends TlsServerProtocol {
 
-        public BcPskTlsServerProtocol(InputStream input, OutputStream output) {
-            super(input, output);
-        }
-
-        @Override
-        protected void raiseAlertFatal(short alertDescription, String message, Throwable cause) throws IOException {
-            cause.printStackTrace();
-        }
-
-        @Override
-        protected void raiseAlertWarning(short alertDescription, String message) throws IOException {
-            if (DEBUG) {
-                System.out.println(message);
+    /**
+     * The negotiation policy this factory was built with: BcPskSSLEngine reads the ALPN
+     * names it offers and the session-validity window from it.
+     */
+    protected BcPskTlsParams getConfiguration() {
+        return params;
+    }
+    /**
+     * Bouncy Castle zeroes the pre-shared key buffer it is handed (TlsPSKKeyExchange.generatePreMasterSecret
+     * does Arrays.fill(psk, 0)), so a manager whose getPSK() returns a caller-owned array is destroyed by the
+     * first handshake that uses it. This wrapper hands out a fresh copy on each read instead.
+     */
+    private static TlsPSKIdentityManager copyOnRead(final TlsPSKIdentityManager manager) {
+        return new TlsPSKIdentityManager() {
+            @Override
+            public byte[] getHint() {
+                return manager.getHint();
             }
-        }
+
+            @Override
+            public byte[] getPSK(byte[] identity) {
+                return copy(manager.getPSK(identity));
+            }
+        };
+    }
+
+    private static byte[] copy(final byte[] value) {
+        return value == null ? null : Arrays.copyOf(value, value.length);
+    }
+
+    /**
+     * Builds this factory's alert-policy server protocol over the given streams.
+     */
+    BcPskTlsServerProtocol createProtocol(InputStream input, OutputStream output) {
+        return new BcPskTlsServerProtocol(input, output, this);
+    }
+
+    /**
+     * Builds this factory's alert-policy server protocol in org.bouncycastle.tls.TlsProtocol's
+     * non-blocking (queue) mode, for javax.net.ssl.SSLEngine callers that feed the record
+     * layer through offerInput()/readOutput() rather than streams.
+     */
+    BcPskTlsServerProtocol createProtocol() {
+        return new BcPskTlsServerProtocol(this);
     }
 
     @Override
-    public ServerSocket createServerSocket() throws IOException {
-        TlsServer tlsServer = new PSKTlsServer(crypto, pskIdentityMgr) {
+    public ServerSocket createServerSocket(int port) throws IOException {
+        return createServerSocket(port, DEFAULT_BACKLOG);
+    }
+
+    @Override
+    public ServerSocket createServerSocket(int port, int backlog) throws IOException {
+        return createSSLServerSocket(port, backlog, null);
+    }
+
+    @Override
+    public ServerSocket createServerSocket(int port, int backlog, InetAddress ifAddress) throws IOException {
+        return createSSLServerSocket(port, backlog, ifAddress);
+    }
+
+    /**
+     * Builds the Bouncy Castle server for one accepted connection. The handshake is driven by the
+     * socket's enabled cipher suites and protocols rather than everything the factory supports, so
+     * setEnabledCipherSuites()/setEnabledProtocols() actually constrain negotiation. One server per
+     * accepted socket also keeps AbstractTlsServer's per-handshake state (ALPN names, selected
+     * protocol) off objects shared between concurrent handshakes. The ALPN names offered to the peer
+     * come in as an argument so a socket carrying a handshake application-protocol selector can
+     * narrow them; an empty list offers none.
+     */
+    protected TlsServer createTlsServer(final String[] enabledCipherSuites, final String[] enabledProtocols,
+                                        final String[] applicationProtocols) {
+        return new PSKTlsServer(crypto, copyOnRead(pskIdentityMgr)) {
             @Override
             protected ProtocolVersion[] getSupportedVersions() {
-                return params.getSupportedProtocolVersions();
+                return BcPskTlsParams.sortHighestFirst(BcPskTlsParams.fromSupportedProtocolVersions(enabledProtocols));
             }
 
             @Override
             protected int[] getSupportedCipherSuites() {
-                return params.getSupportedCipherSuiteCodes();
+                return BcPskTlsParams.fromSupportedCipherSuiteCodes(enabledCipherSuites);
+            }
+
+            @Override
+            protected Vector getProtocolNames() {
+                String[] protocols = applicationProtocols;
+                if (protocols.length == 0) return null;
+                Vector v = new Vector();
+                for (String p : protocols) {
+                    v.add(ProtocolName.asUtf8Encoding(p));
+                }
+                return v;
             }
 
             @Override
@@ -111,35 +197,16 @@ public class BcPskSSLServerSocketFactory extends SSLServerSocketFactory {
                     }
                 }
 
-                // No matching identity found
+                // None of the peer's identities names a key this manager holds. Refusing here is
+                // deliberate: PSK suites cannot prove either peer without a shared secret.
                 return null;
             }
         };
-        return createSSLServerSocket(tlsServer);
     }
 
-    /**
-     * Not supported.
-     */
     @Override
-    public ServerSocket createServerSocket(int port) throws IOException {
-        throw new UnsupportedOperationException();
-    }
-
-    /**
-     * Not supported.
-     */
-    @Override
-    public ServerSocket createServerSocket(int port, int backlog) throws IOException {
-        throw new UnsupportedOperationException();
-    }
-
-    /**
-     * Not supported.
-     */
-    @Override
-    public ServerSocket createServerSocket(int port, int backlog, InetAddress ifAddress) throws IOException {
-        throw new UnsupportedOperationException();
+    public ServerSocket createServerSocket() throws IOException {
+        return createSSLServerSocket(null, DEFAULT_BACKLOG, null);
     }
 
     @Override
@@ -152,20 +219,159 @@ public class BcPskSSLServerSocketFactory extends SSLServerSocketFactory {
         return params.getSupportedCipherSuites();
     }
 
-    private SSLServerSocket createSSLServerSocket(final TlsServer tlsServer) throws IOException {
-        return new SSLServerSocket() {
-            private TlsServerProtocol tlsServerProtocol;
+    private SSLServerSocket createSSLServerSocket(Integer port, int backlog,
+                                                  InetAddress ifAddress) throws IOException {
+        final BcPskSSLServerSocketFactory factory = this;
+        final ServerSocket delegate = new ServerSocket();
+        delegate.setReuseAddress(true);
+        if (port != null) {
+            SocketAddress endpoint = (ifAddress == null)
+                    ? new InetSocketAddress(port)
+                    : new InetSocketAddress(ifAddress, port);
+            delegate.bind(endpoint, backlog);
+        }
+
+        final SSLServerSocket serverSocket = new SSLServerSocket() {
             private String[] enabledCipherSuites = params.getSupportedCipherSuites();
             private String[] enabledProtocols = params.getSupportedProtocols();
             private boolean enableSessionCreation = true;
 
             @Override
+            public void bind(SocketAddress bindpoint) throws IOException {
+                delegate.bind(bindpoint);
+            }
+
+            @Override
+            public boolean isBound() {
+                return delegate.isBound();
+            }
+
+            @Override
+            public Socket accept() throws IOException {
+                Socket insecureSocket = delegate.accept();
+                // The accepted socket inherits this server socket's enabled sets; the TLS server is
+                // built from them when the handshake starts, so setEnabled* here or on the accepted
+                // socket both constrain negotiation.
+                return new WrappedSocket(insecureSocket, factory, params, enabledCipherSuites, enabledProtocols);
+            }
+
+            @Override
+            public boolean isClosed() {
+                return delegate.isClosed();
+            }
+
+            @Override
             public void close() throws IOException {
-                TlsServerProtocol tsp = tlsServerProtocol;
-                if (tsp != null && !tsp.isClosed()) {
-                    tsp.close();
+                delegate.close();
+            }
+
+            @Override
+            public InetAddress getInetAddress() {
+                return delegate.getInetAddress();
+            }
+
+            @Override
+            public int getLocalPort() {
+                return delegate.getLocalPort();
+            }
+
+            @Override
+            public SocketAddress getLocalSocketAddress() {
+                return delegate.getLocalSocketAddress();
+            }
+
+            @Override
+            public void setSoTimeout(int timeout) throws SocketException {
+                delegate.setSoTimeout(timeout);
+            }
+
+            @Override
+            public int getSoTimeout() throws IOException {
+                return delegate.getSoTimeout();
+            }
+
+            @Override
+            public void setReuseAddress(boolean on) throws SocketException {
+                delegate.setReuseAddress(on);
+            }
+
+            @Override
+            public boolean getReuseAddress() throws SocketException {
+                return delegate.getReuseAddress();
+            }
+
+            @Override
+            public void bind(SocketAddress endpoint, int backlog) throws IOException {
+                delegate.bind(endpoint, backlog);
+            }
+
+            @Override
+            public ServerSocketChannel getChannel() {
+                return delegate.getChannel();
+            }
+
+            @Override
+            public String toString() {
+                if (!delegate.isBound()) {
+                    return "ServerSocket[unbound]";
                 }
-                super.close();
+                return "ServerSocket[addr=" + delegate.getInetAddress() +
+                        ",localport=" + delegate.getLocalPort() + "]";
+            }
+
+            @Override
+            public void setReceiveBufferSize(int size) throws SocketException {
+                delegate.setReceiveBufferSize(size);
+            }
+
+            @Override
+            public int getReceiveBufferSize() throws SocketException {
+                return delegate.getReceiveBufferSize();
+            }
+
+            @Override
+            public void setPerformancePreferences(int connectionTime, int latency, int bandwidth) {
+                delegate.setPerformancePreferences(connectionTime, latency, bandwidth);
+            }
+
+            @Override
+            public <T> ServerSocket setOption(SocketOption<T> name, T value) throws IOException {
+                return delegate.setOption(name, value);
+            }
+
+            @Override
+            public <T> T getOption(SocketOption<T> name) throws IOException {
+                return delegate.getOption(name);
+            }
+
+            @Override
+            public Set<SocketOption<?>> supportedOptions() {
+                return delegate.supportedOptions();
+            }
+
+            @Override
+            public void setSSLParameters(SSLParameters sslParameters) {
+                if (sslParameters == null) {
+                    throw new IllegalArgumentException("'sslParameters' cannot be null");
+                }
+
+                String[] cipherSuites = sslParameters.getCipherSuites();
+                if (cipherSuites != null) {
+                    setEnabledCipherSuites(cipherSuites);
+                }
+
+                String[] protocols = sslParameters.getProtocols();
+                if (protocols != null) {
+                    setEnabledProtocols(protocols);
+                }
+            }
+
+            // The handshake reads this socket's enabled sets and ALPN names; it picks its own suite
+            // order when it answers a client's offer, so the order flag is set here.
+            @Override
+            public SSLParameters getSSLParameters() {
+                return BcPskTlsParams.fromEnabledState(getEnabledCipherSuites(), getEnabledProtocols(),
+                        params.getApplicationProtocols(), true);
             }
 
             @Override
@@ -205,16 +411,8 @@ public class BcPskSSLServerSocketFactory extends SSLServerSocketFactory {
 
             @Override
             public void setEnabledCipherSuites(String[] suites) {
-                Set<String> supported = new HashSet<>();
-                Collections.addAll(supported, getSupportedCipherSuites());
-
-                List<String> enabled = new ArrayList<>();
-                for (String s : suites) {
-                    if (supported.contains(s)) {
-                        enabled.add(s);
-                    }
-                }
-                enabledCipherSuites = enabled.toArray(new String[0]);
+                // Same contract as the accepted socket: unknown names are rejected, not dropped
+                enabledCipherSuites = BcPskTlsParams.requireSupported(suites, getSupportedCipherSuites(), "cipher suite");
             }
 
             @Override
@@ -224,45 +422,131 @@ public class BcPskSSLServerSocketFactory extends SSLServerSocketFactory {
 
             @Override
             public void setEnabledProtocols(String[] protocols) {
-                Set<String> supported = new HashSet<>();
-                Collections.addAll(supported, getSupportedProtocols());
-
-                List<String> enabled = new ArrayList<>();
-                for (String s : protocols) {
-                    if (supported.contains(s)) {
-                        enabled.add(s);
-                    }
-                }
-                enabledProtocols = enabled.toArray(new String[0]);
+                enabledProtocols = BcPskTlsParams.requireSupported(protocols, getSupportedProtocols(), "protocol");
             }
 
             @Override
             public void setNeedClientAuth(boolean need) {
-                // Ignored, PSK ensures mutual auth
+                // PSK suites prove both peers hold the shared secret, so client authentication
+                // has nothing to configure.
             }
 
             @Override
             public void setUseClientMode(boolean mode) {
-                // Ignored, PSK ensures mutual auth
+                // PSK suites prove both peers hold the shared secret, so client/server mode
+                // has nothing to configure.
             }
 
             @Override
             public void setWantClientAuth(boolean want) {
-                // Ignored, PSK ensures mutual auth
+                // PSK suites prove both peers hold the shared secret, so client authentication
+                // has nothing to configure.
             }
 
             @Override
             public String[] getSupportedCipherSuites() {
                 return params.getSupportedCipherSuites();
             }
-
-            @Override
-            public Socket accept() throws IOException {
-                Socket insecureSocket = super.accept();
-                tlsServerProtocol = new BcPskTlsServerProtocol(insecureSocket.getInputStream(), insecureSocket.getOutputStream());
-                tlsServerProtocol.accept(tlsServer);
-                return new WrappedSocket(insecureSocket, tlsServerProtocol.getInputStream(), tlsServerProtocol.getOutputStream());
-            }
         };
+
+        return serverSocket;
+    }
+}
+
+/**
+ * This factory's org.bouncycastle.tls.TlsServerProtocol with the alert policy the socket classes
+ * used to inline, plus the negotiated-session accessors BcPskSSLEngine needs. Package level,
+ * not nested in the factory, so BcPskSSLEngine can name the type.
+ */
+class BcPskTlsServerProtocol extends TlsServerProtocol {
+    private final BcPskSSLServerSocketFactory factory;
+
+    // Streams-backed: BC's blocking record layer sits directly on the accepted socket's
+    // streams (org/bouncycastle/tls/TlsProtocol.java:182 picks blocking mode from the ctor shape).
+    public BcPskTlsServerProtocol(InputStream input, OutputStream output,
+                                                BcPskSSLServerSocketFactory factory) {
+        super(input, output);
+        this.factory = factory;
+    }
+
+    // No streams: org/bouncycastle/tls/TlsProtocol.java:174, the queue-backed non-blocking variant
+    // javax.net.ssl.SSLEngine callers drive with offerInput()/readOutput().
+    public BcPskTlsServerProtocol(BcPskSSLServerSocketFactory factory) {
+        super();
+        this.factory = factory;
+    }
+
+    // javax/net/ssl/SSLEngine.java#closeOutbound(): closes only the outbound
+    // half and queues its close_notify alert, so BcPskSSLEngine asks for the alert alone instead
+    // of Bouncy Castle's TlsProtocol#close(), which closes both halves at once.
+    public void raiseCloseNotifyAlert() throws IOException {
+        raiseAlertWarning(AlertDescription.close_notify,
+                "Connection closed by javax.net.ssl.SSLEngine#closeOutbound()");
+    }
+
+    @Override
+    protected void raiseAlertFatal(short alertDescription, String message, Throwable cause) throws IOException {
+        if (!blocking) {
+            // javax.net.ssl.SSLEngine has no channel to hand an alert to the caller mid-record, so
+            // the alert stays in the record layer's output queue and wrap() flushes it, the way
+            // org/bouncycastle/tls/TlsProtocol.java:1710 does it for Bouncy Castle's jsse
+            // org/bouncycastle/jsse/provider/ProvSSLEngine.java.
+            TlsPeer peer = getPeer();
+            if (peer != null) {
+                peer.notifyAlertRaised(AlertLevel.fatal, alertDescription, message, cause);
+            }
+            try {
+                safeWriteRecord(ContentType.alert,
+                        new byte[] { (byte) AlertLevel.fatal, (byte) alertDescription }, 0, 2);
+            } catch (IOException e) {
+                // Already on an error path; a queue that cannot hold the alert changes nothing.
+            }
+            return;
+        }
+
+        if (factory.throwIOExceptionOnFatalAlert) {
+            throw new IOException(message, cause);
+        }
+
+        // Legacy mode: report the alert and let the caller see a successful handshake.
+        System.err.println("Fatal alert: " + message);
+        if (cause != null) {
+            cause.printStackTrace();
+        }
+    }
+
+    @Override
+    protected void raiseAlertWarning(short alertDescription, String message) throws IOException {
+        if (!blocking) {
+            // close_notify must reach the peer: javax/net/ssl/SSLEngine.java#closeOutbound() only closes the outbound
+            // half, and the alert it queued still has to be flushed with wrap() before isOutboundDone() answers true.
+            TlsPeer peer = getPeer();
+            if (peer != null) {
+                peer.notifyAlertRaised(AlertLevel.warning, alertDescription, message, null);
+            }
+            safeWriteRecord(ContentType.alert,
+                    new byte[] { (byte) AlertLevel.warning, (byte) alertDescription }, 0, 2);
+            return;
+        }
+
+        if (factory.logWarnings) {
+            System.out.println(message);
+        }
+    }
+
+    String getCipherSuite() {
+        return BcPskTlsParams.getCipherSuite(getContext());
+    }
+
+    String getProtocol() {
+        return BcPskTlsParams.getProtocol(getContext());
+    }
+
+    byte[] getSessionId() {
+        return BcPskTlsParams.getSessionId(getContext());
+    }
+
+    String getApplicationProtocol() {
+        return BcPskTlsParams.getApplicationProtocol(getContext());
     }
 }
